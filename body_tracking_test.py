@@ -2,6 +2,13 @@ import pyzed.sl as sl
 import math
 import cv2
 import numpy as np
+import websocket
+import time
+
+## define connection esp
+ws = websocket.WebSocket()
+ws.connect("ws://192.168.4.1:81")
+
 
 # Updated indices for BODY_38
 # Wrist: L=16, R=17 | Elbow: L=14, R=15 | Hip: L=18, R=19
@@ -76,10 +83,14 @@ def main():
 
                     if is_arms_crossed(l_wrist_3d, r_wrist_3d, l_elbow_3d, r_elbow_3d):
                         gesture_text = "Arms Crossed!"
+                        ws.send("buzz")
                         color = (0, 0, 255)
                     elif is_hands_in_pockets(l_wrist_3d, r_wrist_3d, l_hip_3d, r_hip_3d):
                         gesture_text = "Hands in Pockets!"
+                        ws.send("buzz")
                         color = (255, 0, 0)
+                    else:
+                        ws.send("stop")
 
                     # --- Rendering 38 Keypoints & Bones ---
                     kp_2d = body.keypoint_2d
