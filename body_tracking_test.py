@@ -3,27 +3,33 @@ import math
 import cv2
 import numpy as np
 import websocket
+import time
 from collections import deque
 
-## define connection esp
-ws = websocket.WebSocket()
-ws.connect("ws://192.168.4.1:81")
+# --- CONFIGURATION ---
+WS_URL = "ws://192.168.4.1:81"
+SWAY_THRESHOLD = 180  # mm
+BUZZ_COOLDOWN = 1.5   # Seconds the buzzer stays on once triggered
+# ---------------------
 
-# --- Detection Logic ---
+try:
+    ws = websocket.WebSocket()
+    ws.connect(WS_URL)
+    print(f"Connected to ESP32 at {WS_URL}")
+except Exception as e:
+    print(f"Could not connect to WebSocket: {e}")
+    # We'll continue so you can still test the ZED logic without the ESP
+    ws = None
 
 def is_arms_crossed(kp_3d):
-    l_wrist, r_wrist = kp_3d[16], kp_3d[17]
-    l_elbow, r_elbow = kp_3d[14], kp_3d[15]
-    return math.dist(l_wrist, r_elbow) < 200 and math.dist(r_wrist, l_elbow) < 200
+    return math.dist(kp_3d[16], kp_3d[15]) < 200 and math.dist(kp_3d[17], kp_3d[14]) < 200
 
 def is_hands_in_pockets(kp_3d):
-    l_wrist, r_wrist = kp_3d[16], kp_3d[17]
-    l_hip, r_hip = kp_3d[18], kp_3d[19]
-    return math.dist(l_wrist, l_hip) < 150 and math.dist(r_wrist, r_hip) < 150
+    return math.dist(kp_3d[16], kp_3d[18]) < 150 and math.dist(kp_3d[17], kp_3d[19]) < 150
 
-def check_sway(history, threshold=180):
+def check_sway(history):
     if len(history) < 30: return False
-    return (max(history) - min(history)) > threshold
+    return (max(history) - min(history)) > SWAY_THRESHOLD
 
 BODY_38_BONES = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 10), (10, 12), (12, 14), (14, 16), (4, 11), (11, 13), (13, 15), (15, 17), (0, 18), (18, 20), (20, 22), (0, 19), (19, 21), (21, 23)]
 
@@ -33,7 +39,9 @@ def main():
     init_params.camera_resolution = sl.RESOLUTION.HD720
     init_params.coordinate_units = sl.UNIT.MILLIMETER
     
-    if zed.open(init_params) != sl.ERROR_CODE.SUCCESS: exit(1)
+    if zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
+        print("Failed to open ZED")
+        return
 
     zed.enable_positional_tracking(sl.PositionalTrackingParameters())
     body_param = sl.BodyTrackingParameters()
@@ -41,70 +49,84 @@ def main():
     body_param.body_format = sl.BODY_FORMAT.BODY_38
     zed.enable_body_tracking(body_param)
 
-    body_runtime_param = sl.BodyTrackingRuntimeParameters()
     bodies = sl.Bodies()
     image_zed = sl.Mat()
-
-    sway_history = {}
     
-    # --- NEW: State Tracking ---
-    # Stores the last message sent for each person: {id: "stop" or "buzz"}
-    last_sent_state = {} 
+    sway_history = {}
+    last_sent_state = "stop"
+    last_buzz_time = 0 
 
-    print("Optimized Tracking Active...")
+    print("\n[RUNNING] Click on the ZED Video Window and press 'q' to quit.")
 
-    while True:
-        if zed.grab() == sl.ERROR_CODE.SUCCESS:
-            zed.retrieve_image(image_zed, sl.VIEW.LEFT)
-            zed.retrieve_bodies(bodies, body_runtime_param)
-            image_ocv = image_zed.get_data()
+    try:
+        while True:
+            if zed.grab() == sl.ERROR_CODE.SUCCESS:
+                zed.retrieve_image(image_zed, sl.VIEW.LEFT)
+                zed.retrieve_bodies(bodies, sl.BodyTrackingRuntimeParameters())
+                image_ocv = image_zed.get_data()
 
-            current_ids = [b.id for b in bodies.body_list]
-            # Cleanup old IDs
-            sway_history = {id: h for id, h in sway_history.items() if id in current_ids}
-            last_sent_state = {id: s for id, s in last_sent_state.items() if id in current_ids}
+                current_bad_posture = False
+                current_time = time.time()
 
-            for body in bodies.body_list:
-                if body.keypoint.size > 0 and body.tracking_state == sl.OBJECT_TRACKING_STATE.OK:
-                    kp_3d = body.keypoint
-                    
-                    # 1. Update Sway History
-                    if body.id not in sway_history:
-                        sway_history[body.id] = deque(maxlen=45)
-                    sway_history[body.id].append(kp_3d[3][0])
+                for body in bodies.body_list:
+                    if body.keypoint.size > 0 and body.tracking_state == sl.OBJECT_TRACKING_STATE.OK:
+                        kp_3d = body.keypoint
+                        
+                        # Sway update
+                        if body.id not in sway_history:
+                            sway_history[body.id] = deque(maxlen=45)
+                        sway_history[body.id].append(kp_3d[3][0])
 
-                    # 2. Determine Current Condition
-                    bad_posture = is_arms_crossed(kp_3d) or is_hands_in_pockets(kp_3d) or check_sway(sway_history[body.id])
-                    current_msg = "buzz" if bad_posture else "stop"
+                        # Logic check
+                        crossed = is_arms_crossed(kp_3d)
+                        pockets = is_hands_in_pockets(kp_3d)
+                        swaying = check_sway(sway_history[body.id])
 
-                    # 3. ONLY Send if the state has changed
-                    if body.id not in last_sent_state or last_sent_state[body.id] != current_msg:
-                        try:
-                            ws.send(current_msg)
-                            last_sent_state[body.id] = current_msg
-                            print(f"Sent {current_msg} for Person {body.id}")
-                        except Exception as e:
-                            print(f"WS Error: {e}")
-
-                    # --- Rendering ---
-                    gesture_text = "ALERT" if bad_posture else "OK"
-                    color = (0, 0, 255) if bad_posture else (0, 255, 0)
-                    
-                    kp_2d = body.keypoint_2d
-                    for bone in BODY_38_BONES:
-                        pt1, pt2 = kp_2d[bone[0]], kp_2d[bone[1]]
-                        if not (math.isnan(pt1[0]) or math.isnan(pt2[0])):
-                            cv2.line(image_ocv, (int(pt1[0]), int(pt1[1])), (int(pt2[0]), int(pt2[1])), (255, 255, 255), 2)
-
-                    if not math.isnan(body.bounding_box_2d[0][0]):
-                        box = body.bounding_box_2d
-                        cv2.putText(image_ocv, f"ID {body.id}: {gesture_text}", (int(box[0][0]), int(box[0][1]) - 10), 
+                        if crossed or pockets or swaying:
+                            current_bad_posture = True
+                        
+                        # Drawing (Optional: keep for debugging)
+                        color = (0, 0, 255) if current_bad_posture else (0, 255, 0)
+                        cv2.putText(image_ocv, f"ID {body.id}: {'BAD' if current_bad_posture else 'OK'}", 
+                                    (int(body.bounding_box_2d[0][0]), int(body.bounding_box_2d[0][1]) - 10), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            cv2.imshow("ZED Feedback", image_ocv)
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
+                # --- COOLDOWN & WEBSOCKET LOGIC ---
+                desired_state = "stop"
+                
+                # If we detect bad posture, we want to buzz
+                if current_bad_posture:
+                    desired_state = "buzz"
+                    last_buzz_time = current_time
+                
+                # If we are in the cooldown period, force the state to stay "buzz"
+                elif (current_time - last_buzz_time) < BUZZ_COOLDOWN:
+                    desired_state = "buzz"
 
-    zed.close()
+                # Send only on change
+                if desired_state != last_sent_state:
+                    if ws:
+                        try:
+                            ws.send(desired_state)
+                            print(f"Action: {desired_state.upper()}")
+                        except: pass
+                    last_sent_state = desired_state
+
+                # --- RENDER & EXIT ---
+                cv2.imshow("ZED Monitor", image_ocv)
+                
+                # Fix: Check for 'q' OR the window 'X' button being clicked
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or cv2.getWindowProperty("ZED Monitor", cv2.WND_PROP_VISIBLE) < 1:
+                    break
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by user in terminal.")
+    finally:
+        print("Closing resources...")
+        if ws: ws.close()
+        zed.close()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
