@@ -6,3 +6,7 @@ Libraries Used:
 WebSocketsServer: https://github.com/Links2004/arduinoWebSockets
 DFRobotDFPlayerMini: https://github.com/DFRobot/DFRobotDFPlayerMini
 Python Websockets: https://websockets.readthedocs.io/en/stable/
+SteroLabs-Zed2i: https://www.stereolabs.com/
+
+AI Used for Coding Aid: Gemini
+Server for Gemini integration: AWS Lightsail
