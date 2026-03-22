@@ -5,11 +5,14 @@ import numpy as np
 import websocket
 import time
 from collections import deque
+import requests
+import json
 
 # --- CONFIGURATION ---
-WS_URL = "ws://192.168.4.1:81"
+WS_URL = "ws://172.27.153.139:81"
 SWAY_THRESHOLD = 180  # mm
 BUZZ_COOLDOWN = 1.5   # Seconds the buzzer stays on once triggered
+AWS_ENDPOINT = "http://3.223.106.18/presentationCoach/data/data_transmission.php"
 # ---------------------
 
 try:
@@ -78,6 +81,25 @@ def main():
                         sway_history[body.id].append(kp_3d[3][0])
 
                         # Logic check
+                        # --- SKELETON RENDERING ---
+                        # Get 2D keypoints for drawing
+                        kp_2d = body.keypoint_2d
+
+                        # Draw Bones
+                        for part in BODY_38_BONES:
+                            kp_a = kp_2d[part[0]]
+                            kp_b = kp_2d[part[1]]
+                            color = (255,255,255)
+                            # Check if keypoints are valid/visible before drawing
+                            if np.isfinite(kp_a).all() and np.isfinite(kp_b).all():
+                                pt1 = (int(kp_a[0]), int(kp_a[1]))
+                                pt2 = (int(kp_b[0]), int(kp_b[1]))
+                                cv2.line(image_ocv, pt1, pt2, color, 2)
+
+                        # Draw Joints (optional but helpful)
+                        for kp in kp_2d:
+                            if np.isfinite(kp).all():
+                                cv2.circle(image_ocv, (int(kp[0]), int(kp[1])), 3, (255, 255, 255), -1)
                         crossed = is_arms_crossed(kp_3d)
                         pockets = is_hands_in_pockets(kp_3d)
                         swaying = check_sway(sway_history[body.id])
@@ -109,8 +131,21 @@ def main():
                         try:
                             ws.send(desired_state)
                             print(f"Action: {desired_state.upper()}")
-                        except: pass
+                        except:
+                            print(f"ESP32 Connection Lost: {e}")
+                    try:
+                        payload = {
+                            "event": desired_state,
+                            "timestamp": time.time(),
+                            "swayval": float(kp_3d[3][0]) if len (kp_3d) > 3 else 0
+                        }
+                        print("Sending data")
+                        requests.post(AWS_ENDPOINT, json=payload, timeout=0.1)
+                        print("Data sent")
+                    except requests.exceptions.RequestException:
+                        print("Cloud logging failed")
                     last_sent_state = desired_state
+
 
                 # --- RENDER & EXIT ---
                 cv2.imshow("ZED Monitor", image_ocv)
