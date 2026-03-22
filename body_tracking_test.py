@@ -75,8 +75,8 @@ def main():
     image_zed = sl.Mat()
     
     sway_history = {}
-    last_sent_state = "stop"
-    last_buzz_time = 0 
+    last_states = {}
+    last_buzz_time = {}
 
     print("\n[RUNNING] Click on the ZED Video Window and press 'q' to quit.")
 
@@ -93,93 +93,51 @@ def main():
                 for body in bodies.body_list:
                     if body.keypoint.size > 0 and body.tracking_state == sl.OBJECT_TRACKING_STATE.OK:
                         kp_3d = body.keypoint
+                        kp_2d = body.keypoint_2d
                         
-                        # Sway update
+                        # 1. Update Sway History
                         if body.id not in sway_history:
                             sway_history[body.id] = deque(maxlen=45)
                         sway_history[body.id].append(kp_3d[3][0])
 
-                        # Logic check
-                        # --- SKELETON RENDERING ---
-                        # Get 2D keypoints for drawing
-                        kp_2d = body.keypoint_2d
+                        # 2. Setup tracking for this specific person's last state
+                        if body.id not in last_states: last_states[body.id] = "idle"
+                        if body.id not in last_buzz_time:
+                            last_buzz_time[body.id] = 0
 
-                        # Draw Bones
-                        for part in BODY_38_BONES:
-                            kp_a = kp_2d[part[0]]
-                            kp_b = kp_2d[part[1]]
-                            color = (255,255,255)
-                            # Check if keypoints are valid/visible before drawing
-                            if np.isfinite(kp_a).all() and np.isfinite(kp_b).all():
-                                pt1 = (int(kp_a[0]), int(kp_a[1]))
-                                pt2 = (int(kp_b[0]), int(kp_b[1]))
-                                cv2.line(image_ocv, pt1, pt2, color, 2)
-
-                        # Draw Joints (optional but helpful)
-                        for kp in kp_2d:
-                            if np.isfinite(kp).all():
-                                cv2.circle(image_ocv, (int(kp[0]), int(kp[1])), 3, (255, 255, 255), -1)
+                        # 3. Posture Logic
                         crossed = is_arms_crossed(kp_3d)
                         pockets = is_hands_in_pockets(kp_3d)
                         swaying = check_sway(sway_history[body.id])
-
-                        if crossed or pockets or swaying:
-                            current_bad_posture = True
                         
-                        # Drawing (Optional: keep for debugging)
-                        color = (0, 0, 255) if current_bad_posture else (0, 255, 0)
-                        cv2.putText(image_ocv, f"ID {body.id}: {'BAD' if current_bad_posture else 'OK'}", 
-                                    (int(body.bounding_box_2d[0][0]), int(body.bounding_box_2d[0][1]) - 10), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-                        # --- COOLDOWN & WEBSOCKET LOGIC ---
-                        desired_state = "idle"
+                        body_bad = crossed or pockets or swaying
                         
-                        # If we detect bad posture, we want to buzz
-                        if current_bad_posture:
-                            desired_state = "buzz"
-                            last_buzz_time = current_time
-                        
-                        # If we are in the cooldown period, force the state to stay "buzz"
-                        elif (current_time - last_buzz_time) < BUZZ_COOLDOWN:
-                            desired_state = "buzz"
+                        # Determine state for THIS body
+                        this_state = "buzz" if body_bad else "idle"
+                        if not body_bad and (current_time - last_buzz_time[body.id]) < BUZZ_COOLDOWN:
+                            this_state = "buzz"
+                        if body_bad: last_buzz_time = current_time
 
-                        # Send only on change
-                        # --- SEND TO CORRECT ESP32 ---
-                        if desired_state != last_sent_state:
-                            print("Entered difference of states")
-                            # Determine which WebSocket to use
-                            target_ws = None
+                        # 4. SEND TO CORRECT ESP32 (Using your custom send function)
+                        if this_state != last_states[body.id]:
                             if body.id == 0:
-                                target_ws = ws1
+                                send(ws1, ip1, this_state)
                             elif body.id == 1:
-                                target_ws = ws2
-
-                            # Send to the ESP32
-                            if target_ws:
-                                print("Sending to ESP")
-                                try:
-                                    target_ws.send(target_ws, "0.0.0.0", desired_state)
-                                    print(f"Body {body.id} Action: {desired_state.upper()}")
-                                except Exception as e:
-                                    print(f"ESP32 {body.id} Connection Lost: {e}")
+                                send(ws2, ip2, this_state)
 
                             # --- CLOUD LOGGING ---
                             try:
                                 payload = {
-                                    "event": desired_state,
-                                    "body_id": body.id, # Added to track which user is which in DB
+                                    "event": this_state,
+                                    "body_id": body.id,
                                     "timestamp": time.time(),
-                                    "swayval": float(kp_3d[3][0]) if len(kp_3d) > 3 else 0
+                                    "swayval": float(kp_3d[3][0])
                                 }
-                                # Using a short timeout to keep the frame rate high
-                                print("sending data...")
-                                requests.post(AWS_ENDPOINT, json=payload, timeout=0.05) 
-                                print("success")
-                            except requests.exceptions.RequestException:
-                                print(f"Cloud logging failed for Body {body.id}")
+                                requests.post(AWS_ENDPOINT, json=payload, timeout=0.05)
+                            except:
+                                pass # Keep frame rate high if AWS fails
                             
-                            last_sent_state = desired_state
+                            last_states[body.id] = this_state
 
 
                     # --- RENDER & EXIT ---
