@@ -9,20 +9,39 @@ import requests
 import json
 
 # --- CONFIGURATION ---
-WS_URL = "ws://172.27.153.139:81"
 SWAY_THRESHOLD = 180  # mm
 BUZZ_COOLDOWN = 1.5   # Seconds the buzzer stays on once triggered
 AWS_ENDPOINT = "http://3.223.106.18/presentationCoach/data/data_transmission.php"
 # ---------------------
 
-try:
-    ws = websocket.WebSocket()
-    ws.connect(WS_URL)
-    print(f"Connected to ESP32 at {WS_URL}")
-except Exception as e:
-    print(f"Could not connect to WebSocket: {e}")
-    # We'll continue so you can still test the ZED logic without the ESP
-    ws = None
+
+## Adding networking
+
+def connect(ip):
+    try:
+        ws = websocket.WebSocket()
+        ws.connect(f"ws://{ip}:81", timeout=3)
+        print(f"Connected: {ip}")
+        return ws
+    except Exception as e:
+        print(f"Failed to connect {ip}: {e}")
+        return None
+    
+def send(ws, ip, command):
+    if ws is None:
+        print(f"  Skipping {ip} — not connected")
+        return
+    try:
+        ws.send(command)
+        print(f"  [{ip}] -> {command}")
+    except Exception as e:
+        print(f"  [{ip}] send failed: {e}")
+
+ip1 = "172.27.153.139"
+ip2 = "172.27.145.98"
+
+ws1 = connect(ip1)
+ws2 = connect(ip2)
 
 def is_arms_crossed(kp_3d):
     return math.dist(kp_3d[16], kp_3d[15]) < 200 and math.dist(kp_3d[17], kp_3d[14]) < 200
@@ -113,42 +132,58 @@ def main():
                                     (int(body.bounding_box_2d[0][0]), int(body.bounding_box_2d[0][1]) - 10), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                # --- COOLDOWN & WEBSOCKET LOGIC ---
-                desired_state = "stop"
-                
-                # If we detect bad posture, we want to buzz
-                if current_bad_posture:
-                    desired_state = "buzz"
-                    last_buzz_time = current_time
-                
-                # If we are in the cooldown period, force the state to stay "buzz"
-                elif (current_time - last_buzz_time) < BUZZ_COOLDOWN:
-                    desired_state = "buzz"
+                        # --- COOLDOWN & WEBSOCKET LOGIC ---
+                        desired_state = "idle"
+                        
+                        # If we detect bad posture, we want to buzz
+                        if current_bad_posture:
+                            desired_state = "buzz"
+                            last_buzz_time = current_time
+                        
+                        # If we are in the cooldown period, force the state to stay "buzz"
+                        elif (current_time - last_buzz_time) < BUZZ_COOLDOWN:
+                            desired_state = "buzz"
 
-                # Send only on change
-                if desired_state != last_sent_state:
-                    if ws:
-                        try:
-                            ws.send(desired_state)
-                            print(f"Action: {desired_state.upper()}")
-                        except:
-                            print(f"ESP32 Connection Lost: {e}")
-                    try:
-                        payload = {
-                            "event": desired_state,
-                            "timestamp": time.time(),
-                            "swayval": float(kp_3d[3][0]) if len (kp_3d) > 3 else 0
-                        }
-                        print("Sending data")
-                        requests.post(AWS_ENDPOINT, json=payload, timeout=0.1)
-                        print("Data sent")
-                    except requests.exceptions.RequestException:
-                        print("Cloud logging failed")
-                    last_sent_state = desired_state
+                        # Send only on change
+                        # --- SEND TO CORRECT ESP32 ---
+                        if desired_state != last_sent_state:
+                            print("Entered difference of states")
+                            # Determine which WebSocket to use
+                            target_ws = None
+                            if body.id == 0:
+                                target_ws = ws1
+                            elif body.id == 1:
+                                target_ws = ws2
+
+                            # Send to the ESP32
+                            if target_ws:
+                                print("Sending to ESP")
+                                try:
+                                    target_ws.send(target_ws, "0.0.0.0", desired_state)
+                                    print(f"Body {body.id} Action: {desired_state.upper()}")
+                                except Exception as e:
+                                    print(f"ESP32 {body.id} Connection Lost: {e}")
+
+                            # --- CLOUD LOGGING ---
+                            try:
+                                payload = {
+                                    "event": desired_state,
+                                    "body_id": body.id, # Added to track which user is which in DB
+                                    "timestamp": time.time(),
+                                    "swayval": float(kp_3d[3][0]) if len(kp_3d) > 3 else 0
+                                }
+                                # Using a short timeout to keep the frame rate high
+                                print("sending data...")
+                                requests.post(AWS_ENDPOINT, json=payload, timeout=0.05) 
+                                print("success")
+                            except requests.exceptions.RequestException:
+                                print(f"Cloud logging failed for Body {body.id}")
+                            
+                            last_sent_state = desired_state
 
 
-                # --- RENDER & EXIT ---
-                cv2.imshow("ZED Monitor", image_ocv)
+                    # --- RENDER & EXIT ---
+                    cv2.imshow("ZED Monitor", image_ocv)
                 
                 # Fix: Check for 'q' OR the window 'X' button being clicked
                 key = cv2.waitKey(1) & 0xFF
@@ -159,7 +194,8 @@ def main():
         print("\nInterrupted by user in terminal.")
     finally:
         print("Closing resources...")
-        if ws: ws.close()
+        if ws1: ws1.close()
+        if ws2: ws2.close()
         zed.close()
         cv2.destroyAllWindows()
 
