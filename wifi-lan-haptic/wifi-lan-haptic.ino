@@ -87,6 +87,5 @@ void loop() {
     delay(1000);
     myDFPlayer.pause();
     delay(500);
-
   }
 }
