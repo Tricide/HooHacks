@@ -6,17 +6,15 @@ import websocket
 import time
 from collections import deque
 import requests
-import json
 
 # --- CONFIGURATION ---
-SWAY_THRESHOLD = 180  # mm
-BUZZ_COOLDOWN = 1.5   # Seconds the buzzer stays on once triggered
+SWAY_THRESHOLD = 180 
+BUZZ_COOLDOWN = 1.5   
 AWS_ENDPOINT = "http://3.223.106.18/presentationCoach/data/data_transmission.php"
-# ---------------------
 
+ip1, ip2 = "172.27.153.139", "172.27.145.98"
 
-## Adding networking
-
+# --- CONNECTIONS ---
 def connect(ip):
     try:
         ws = websocket.WebSocket()
@@ -24,138 +22,86 @@ def connect(ip):
         print(f"Connected: {ip}")
         return ws
     except Exception as e:
-        print(f"Failed to connect {ip}: {e}")
-        return None
-    
+        print(f"Failed {ip}: {e}"); return None
+
 def send(ws, ip, command):
-    if ws is None:
-        print(f"  Skipping {ip} — not connected")
-        return
-    try:
-        ws.send(command)
-        print(f"  [{ip}] -> {command}")
-    except Exception as e:
-        print(f"  [{ip}] send failed: {e}")
+    if ws:
+        try: ws.send(command)
+        except: print(f"Lost connection to {ip}")
 
-ip1 = "172.27.153.139"
-ip2 = "172.27.145.98"
+ws1, ws2 = connect(ip1), connect(ip2)
 
-ws1 = connect(ip1)
-ws2 = connect(ip2)
+# --- TRACKING HELPERS ---
+BODY_38_BONES = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 10), (10, 12), (12, 14), (14, 16), 
+                 (4, 11), (11, 13), (13, 15), (15, 17), (0, 18), (18, 20), (20, 22), 
+                 (0, 19), (19, 21), (21, 23)]
 
-def is_arms_crossed(kp_3d):
-    return math.dist(kp_3d[16], kp_3d[15]) < 200 and math.dist(kp_3d[17], kp_3d[14]) < 200
-
-def is_hands_in_pockets(kp_3d):
-    return math.dist(kp_3d[16], kp_3d[18]) < 150 and math.dist(kp_3d[17], kp_3d[19]) < 150
-
-def check_sway(history):
-    if len(history) < 30: return False
-    return (max(history) - min(history)) > SWAY_THRESHOLD
-
-BODY_38_BONES = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 10), (10, 12), (12, 14), (14, 16), (4, 11), (11, 13), (13, 15), (15, 17), (0, 18), (18, 20), (20, 22), (0, 19), (19, 21), (21, 23)]
+def is_arms_crossed(kp): return math.dist(kp[16], kp[15]) < 200 and math.dist(kp[17], kp[14]) < 200
+def is_hands_in_pockets(kp): return math.dist(kp[16], kp[18]) < 150 and math.dist(kp[17], kp[19]) < 150
+def check_sway(hist): return (max(hist) - min(hist)) > SWAY_THRESHOLD if len(hist) >= 30 else False
 
 def main():
     zed = sl.Camera()
-    init_params = sl.InitParameters()
-    init_params.camera_resolution = sl.RESOLUTION.HD720
-    init_params.coordinate_units = sl.UNIT.MILLIMETER
-    
-    if zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
-        print("Failed to open ZED")
-        return
+    init = sl.InitParameters()
+    init.camera_resolution = sl.RESOLUTION.HD720
+    init.coordinate_units = sl.UNIT.MILLIMETER
+    if zed.open(init) != sl.ERROR_CODE.SUCCESS: return
 
     zed.enable_positional_tracking(sl.PositionalTrackingParameters())
-    body_param = sl.BodyTrackingParameters()
-    body_param.enable_body_fitting = True  
-    body_param.body_format = sl.BODY_FORMAT.BODY_38
-    zed.enable_body_tracking(body_param)
+    body_p = sl.BodyTrackingParameters()
+    body_p.enable_body_fitting = True
+    body_p.body_format = sl.BODY_FORMAT.BODY_38
+    zed.enable_body_tracking(body_p)
 
-    bodies = sl.Bodies()
-    image_zed = sl.Mat()
-    
-    sway_history = {}
-    last_states = {}
-    last_buzz_time = {}
+    bodies, image_zed = sl.Bodies(), sl.Mat()
+    sway_history, last_states, last_buzz_times = {}, {}, {}
 
-    print("\n[RUNNING] Click on the ZED Video Window and press 'q' to quit.")
+    while True:
+        if zed.grab() == sl.ERROR_CODE.SUCCESS:
+            zed.retrieve_image(image_zed, sl.VIEW.LEFT)
+            zed.retrieve_bodies(bodies, sl.BodyTrackingRuntimeParameters())
+            frame = image_zed.get_data()
+            curr_t = time.time()
 
-    try:
-        while True:
-            if zed.grab() == sl.ERROR_CODE.SUCCESS:
-                zed.retrieve_image(image_zed, sl.VIEW.LEFT)
-                zed.retrieve_bodies(bodies, sl.BodyTrackingRuntimeParameters())
-                image_ocv = image_zed.get_data()
+            for body in bodies.body_list:
+                if body.tracking_state == sl.OBJECT_TRACKING_STATE.OK:
+                    kp3, kp2 = body.keypoint, body.keypoint_2d
+                    
+                    # 1. Init user data
+                    bid = body.id
+                    if bid not in sway_history:
+                        sway_history[bid] = deque(maxlen=45)
+                        last_states[bid], last_buzz_times[bid] = "stop", 0
 
-                current_bad_posture = False
-                current_time = time.time()
+                    # 2. Logic
+                    sway_history[bid].append(kp3[3][0])
+                    is_bad = is_arms_crossed(kp3) or is_hands_in_pockets(kp3) or check_sway(sway_history[bid])
+                    
+                    state = "buzz" if is_bad or (curr_t - last_buzz_times[bid] < BUZZ_COOLDOWN) else "idle"
+                    if is_bad: last_buzz_times[bid] = curr_t
 
-                for body in bodies.body_list:
-                    if body.keypoint.size > 0 and body.tracking_state == sl.OBJECT_TRACKING_STATE.OK:
-                        kp_3d = body.keypoint
-                        kp_2d = body.keypoint_2d
-                        
-                        # 1. Update Sway History
-                        if body.id not in sway_history:
-                            sway_history[body.id] = deque(maxlen=45)
-                        sway_history[body.id].append(kp_3d[3][0])
+                    # 3. Draw Skeleton (DEBUG)
+                    # Red if Buzzing, Green if Idle
+                    color = (0, 0, 255) if state == "buzz" else (0, 255, 0)
+                    
+                    for bone in BODY_38_BONES:
+                        p1, p2 = kp2[bone[0]], kp2[bone[1]]
+                        if np.isfinite(p1).all() and np.isfinite(p2).all():
+                            cv2.line(frame, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), color, 2)
 
-                        # 2. Setup tracking for this specific person's last state
-                        if body.id not in last_states: last_states[body.id] = "idle"
-                        if body.id not in last_buzz_time:
-                            last_buzz_time[body.id] = 0
+                    # 4. Networking
+                    if state != last_states[bid]:
+                        send(ws1 if bid == 0 else ws2, ip1 if bid == 0 else ip2, state)
+                        try:
+                            requests.post(AWS_ENDPOINT, json={"event": state, "body_id": bid, "swayval": float(kp3[3][0])}, timeout=0.05)
+                        except: pass
+                        last_states[bid] = state
 
-                        # 3. Posture Logic
-                        crossed = is_arms_crossed(kp_3d)
-                        pockets = is_hands_in_pockets(kp_3d)
-                        swaying = check_sway(sway_history[body.id])
-                        
-                        body_bad = crossed or pockets or swaying
-                        
-                        # Determine state for THIS body
-                        this_state = "buzz" if body_bad else "idle"
-                        if not body_bad and (current_time - last_buzz_time[body.id]) < BUZZ_COOLDOWN:
-                            this_state = "buzz"
-                        if body_bad: last_buzz_time = current_time
+            cv2.imshow("ZED Debug Monitor", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
 
-                        # 4. SEND TO CORRECT ESP32 (Using your custom send function)
-                        if this_state != last_states[body.id]:
-                            if body.id == 0:
-                                send(ws1, ip1, this_state)
-                            elif body.id == 1:
-                                send(ws2, ip2, this_state)
-
-                            # --- CLOUD LOGGING ---
-                            try:
-                                payload = {
-                                    "event": this_state,
-                                    "body_id": body.id,
-                                    "timestamp": time.time(),
-                                    "swayval": float(kp_3d[3][0])
-                                }
-                                requests.post(AWS_ENDPOINT, json=payload, timeout=0.05)
-                            except:
-                                pass # Keep frame rate high if AWS fails
-                            
-                            last_states[body.id] = this_state
-
-
-                    # --- RENDER & EXIT ---
-                    cv2.imshow("ZED Monitor", image_ocv)
-                
-                # Fix: Check for 'q' OR the window 'X' button being clicked
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q') or cv2.getWindowProperty("ZED Monitor", cv2.WND_PROP_VISIBLE) < 1:
-                    break
-
-    except KeyboardInterrupt:
-        print("\nInterrupted by user in terminal.")
-    finally:
-        print("Closing resources...")
-        if ws1: ws1.close()
-        if ws2: ws2.close()
-        zed.close()
-        cv2.destroyAllWindows()
+    zed.close()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
