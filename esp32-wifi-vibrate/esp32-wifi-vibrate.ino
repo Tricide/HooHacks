@@ -54,7 +54,6 @@ void loop() {
 }
 
 void triggerHaptic() {
-  // your DFPlayer or motor code here
   digitalWrite(LED_BUILTIN, HIGH);
   myDFPlayer.play(3);  // burst on
   delay(200);
