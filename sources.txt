@@ -1,0 +1,8 @@
+Hardware Used:
+ESP32-C3: https://www.espressif.com/en/products/socs/esp32-c3
+DFPlayer Mini: https://wiki.dfrobot.com/dfr0299/
+
+Libraries Used:
+WebSocketsServer: https://github.com/Links2004/arduinoWebSockets
+DFRobotDFPlayerMini: https://github.com/DFRobot/DFRobotDFPlayerMini
+Python Websockets: https://websockets.readthedocs.io/en/stable/
